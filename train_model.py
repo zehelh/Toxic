@@ -16,6 +16,8 @@ import joblib
 from toxic_words import TOXIC_WORDS, TOXIC_CATEGORIES
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from scipy.sparse import hstack
+from scipy.sparse import csr_matrix as sparse
 
 warnings.filterwarnings('ignore')
 
@@ -35,12 +37,12 @@ class ToxicClassifier:
         self.stop_words = list(ENGLISH_STOP_WORDS.union(custom_stop_words))
         
         self.vectorizer = TfidfVectorizer(
-            max_features=10000,  # Retour à 10000
+            max_features=5000,  # Réduit
             strip_accents='unicode',
             lowercase=True,
             stop_words=self.stop_words,
             token_pattern=r'\b\w+\b',
-            ngram_range=(1, 2)  # Réactivation des bigrammes
+            ngram_range=(1, 1)  # Uniquement unigrammes
         )
     
     def get_toxic_features(self, text):
@@ -122,18 +124,15 @@ class ToxicClassifier:
     
     def objective(self, trial):
         try:
-            # Paramètres communs pour TF-IDF - plage réduite
             params = {
-                'max_features': trial.suggest_int('max_features', 5000, 10000)  # Réduit de 20000 à 10000
+                'max_features': trial.suggest_int('max_features', 1000, 5000),
+                'C': trial.suggest_float('C', 0.5, 5.0, log=True),
+                'class_weight': trial.suggest_categorical('class_weight', ['balanced']),
+                'max_iter': trial.suggest_int('max_iter', 50, 100)
             }
             
             # Paramètres spécifiques selon le modèle
             if self.model_type == 'logreg':
-                params.update({
-                    'C': trial.suggest_float('C', 0.5, 5.0, log=True),  # Plage réduite
-                    'class_weight': trial.suggest_categorical('class_weight', ['balanced']),  # Un seul choix
-                    'max_iter': trial.suggest_int('max_iter', 100, 150)  # Plage réduite
-                })
                 model = LogisticRegression(
                     C=params['C'],
                     class_weight=params['class_weight'],
@@ -143,49 +142,21 @@ class ToxicClassifier:
                     n_jobs=self.n_jobs
                 )
             elif self.model_type == 'rf':
-                params.update({
-                    'n_estimators': trial.suggest_int('n_estimators', 100, 300),  # Réduit de 1000 à 300
-                    'max_depth': trial.suggest_int('max_depth', 5, 10),  # Plage réduite
-                    'min_samples_split': trial.suggest_int('min_samples_split', 5, 10),  # Plage réduite
-                    'min_samples_leaf': trial.suggest_int('min_samples_leaf', 2, 5),  # Plage réduite
-                    'class_weight': trial.suggest_categorical('class_weight', ['balanced'])  # Un seul choix
-                })
                 model = RandomForestClassifier(**params)
             else:  # lightgbm
-                params.update({
-                    'n_estimators': trial.suggest_int('n_estimators', 100, 300),  # Réduit
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),  # Plage réduite
-                    'num_leaves': trial.suggest_int('num_leaves', 20, 50),  # Réduit
-                    'max_depth': trial.suggest_int('max_depth', 5, 10),  # Plage réduite
-                    'min_child_samples': trial.suggest_int('min_child_samples', 10, 50),  # Plage réduite
-                    'subsample': trial.suggest_float('subsample', 0.7, 0.9),  # Plage réduite
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.9)  # Plage réduite
-                })
                 model = lgb.LGBMClassifier(**params)
             
-            # Mise à jour du vectorizer
-            self.vectorizer.set_params(max_features=params['max_features'])
-            
-            # Transformation du texte
+            # Transformation sans conversion dense
             X_train_tfidf = self.vectorizer.fit_transform(self.X_train_text)
             X_valid_tfidf = self.vectorizer.transform(self.X_valid_text)
             
-            # Conversion en array dense
-            X_train_tfidf_dense = X_train_tfidf.toarray()
-            X_valid_tfidf_dense = X_valid_tfidf.toarray()
+            # Features toxiques en sparse
+            X_train_toxic = sparse.csr_matrix(self.X_train_toxic.astype(float))
+            X_valid_toxic = sparse.csr_matrix(self.X_valid_toxic.astype(float))
             
-            # Standardisation des features toxiques
-            X_train_toxic_float = self.X_train_toxic.astype(float)
-            X_valid_toxic_float = self.X_valid_toxic.astype(float)
-            
-            # Standardisation
-            scaler = StandardScaler(with_mean=True, with_std=True)
-            X_train_toxic_scaled = scaler.fit_transform(X_train_toxic_float)
-            X_valid_toxic_scaled = scaler.transform(X_valid_toxic_float)
-            
-            # Concaténation
-            X_train_combined = np.hstack([X_train_tfidf_dense, X_train_toxic_scaled])
-            X_valid_combined = np.hstack([X_valid_tfidf_dense, X_valid_toxic_scaled])
+            # Concaténation sparse
+            X_train_combined = hstack([X_train_tfidf, X_train_toxic])
+            X_valid_combined = hstack([X_valid_tfidf, X_valid_toxic])
             
             # Entraînement et prédiction
             with warnings.catch_warnings():
@@ -212,9 +183,9 @@ class ToxicClassifier:
         # Réduction plus agressive du jeu de validation
         if len(X_valid) > 5000:
             print("Réduction du jeu de validation à 5000 exemples...")
-            idx = np.random.choice(len(X_valid), 5000, replace=False)
-            X_valid = X_valid.iloc[idx]
-            y_valid = y_valid.iloc[idx]
+            self.valid_idx = np.random.choice(len(X_valid), 5000, replace=False)
+            X_valid = X_valid.iloc[self.valid_idx]
+            y_valid = y_valid.iloc[self.valid_idx]
         
         # Prétraitement des données
         self.X_train_text, self.X_train_toxic = self.preprocess_text(X_train)
@@ -241,7 +212,7 @@ class ToxicClassifier:
         
         self.pipeline.fit(X_train_final, self.y_train)
         
-        # Évaluation finale sur l'ensemble de validation
+        # Utilisation des mêmes données de validation que pendant l'optimisation
         X_valid_final = pd.DataFrame({
             'text': self.X_valid_text.fillna('').astype(str),
             **{str(col): self.X_valid_toxic[col] for col in self.X_valid_toxic.columns}
@@ -291,6 +262,7 @@ class ToxicClassifier:
                 text = X['text'].fillna('').astype(str).values
                 toxic_features = X.drop('text', axis=1).astype(float)
                 
+                # Transformation sparse
                 self.vectorizer.fit(text)
                 self.scaler.fit(toxic_features)
                 return self
@@ -300,15 +272,12 @@ class ToxicClassifier:
                 text = X['text'].fillna('').astype(str).values
                 toxic_features = X.drop('text', axis=1).astype(float)
                 
-                # Remplacement explicite des NaN
-                toxic_features = np.nan_to_num(toxic_features, 0)
+                # Transformations sparse
+                text_features = self.vectorizer.transform(text)
+                toxic_features_scaled = sparse.csr_matrix(self.scaler.transform(toxic_features))
                 
-                text_features = self.vectorizer.transform(text).toarray()
-                toxic_features_scaled = self.scaler.transform(toxic_features)
-                
-                combined = np.hstack([text_features, toxic_features_scaled])
-                # Vérification finale des NaN
-                return np.nan_to_num(combined, 0)
+                # Concaténation sparse
+                return hstack([text_features, toxic_features_scaled])
         
         transformer = CombinedFeatureTransformer(self.vectorizer, StandardScaler())
         
@@ -322,7 +291,7 @@ class ToxicClassifier:
 
 if __name__ == "__main__":
     # Configuration
-    n_jobs = min(4, joblib.cpu_count() - 1)  # Réduit de 6 à 4 cœurs
+    n_jobs = min(8, joblib.cpu_count() - 1)  # Réduit de 6 à 4 cœurs
     print(f"Utilisation de {n_jobs} cœurs")
     
     # Chargement des données
